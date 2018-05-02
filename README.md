@@ -12,7 +12,7 @@ A pet project to give a first glance at the Tokio library (basically some copy a
 
 ### Send cmd with:
 
-    $ echo "status" | telnet localhost 6601
+    $ echo "status" | ncat 127.0.0.1 6601
 
 ### Check MPD log
 

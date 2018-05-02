@@ -6,3 +6,4 @@ authors = ["jman"]
 [dependencies]
 tokio = "*"
 encoding = "*"
+tokio-io = "*"
