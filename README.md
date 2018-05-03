@@ -14,6 +14,10 @@ A pet project to give a first glance at the Tokio library (basically some copy a
 
     $ echo "status" | ncat 127.0.0.1 6601
 
+### Check what the server receives:
+
+    $ while true; do ncat -l 6600 ; done
+
 ### Check MPD log
 
     $ tail -f ~/.mpd/mpd.log

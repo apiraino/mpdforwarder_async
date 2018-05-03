@@ -23,34 +23,21 @@ fn main() {
             let (client_writer, client_reader) = client.framed(LinesCodec::new()).split();
             let f = client_reader
                 .into_future()
-                .map(|(val, _split_stream_sonasega)| {
-                    println!("[map] payload: {:?}", val);
-                    val.unwrap()
-                })
                 .map_err(|_| println!("err"))
-                .then(|val| {
-                    println!("[then] payload: {:#?}", val);
-
-                    // TODO: extract string value from Result!
-                    let mut vval = String::new();
-                    match val {
-                        Ok(x) => vval = x,
-                        _ => {}
-                    };
-
+                .and_then(|(payload, client_reader)| {
+                    let payload = payload.unwrap();
+                    println!("payload={} client_reader={:?}", payload, client_reader);
                     let server_addr;
-                    if vval == "quit" {
-                        println!("[then] willing to QUIT");
-                        server_addr = "127.0.0.1:6601".parse::<SocketAddr>().unwrap();
-                    } else {
-                        println!("[then] proxying '{:?}' to MPD", vval);
+                    if payload == "quit" {
                         server_addr = "127.0.0.1:6602".parse::<SocketAddr>().unwrap();
+                    } else {
+                        server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
                     }
-
                     // Connect to the right server and forward the payload
                     let server_conn = TcpStream::connect(&server_addr);
                     let connected = server_conn.map_err(|e| eprintln!("Error: {}", e)).and_then(
                         |server_sock| {
+                            println!("server connected");
                             // NOTE: without wrapping to MyTcpStream, we lose the "shutdown"
                             // when the stream back to the client ends, and the client hangs
                             let server_sock = MyTcpStream(Arc::new(Mutex::new(server_sock)));
@@ -59,13 +46,14 @@ fn main() {
                             let forwarded_payload = client_reader
                                 .forward(server_writer)
                                 .map_err(|e| eprintln!("forward payload error={}", e))
-                                .and_then(|_| {
+                                .and_then(|res| {
+                                    println!("forwarding payload to server: {:?}", res);
                                     let response_written = server_reader
                                         .forward(client_writer)
-                                        .map_err(|_| {})
-                                        .and_then(|_| {
-                                            // NOTE: would like to shutdown here
-                                            // server_sock.shutdown(Shutdown::Write);
+                                        .map_err(|err| eprintln!("[ERR] >>> {:?}", err))
+                                        .then(|res| {
+                                            println!("proxying response back to client: {:?}", res);
+                                            println!("---");
                                             Ok(())
                                         });
                                     tokio::spawn(response_written)
@@ -77,14 +65,13 @@ fn main() {
                 });
             tokio::spawn(f)
         });
-
     tokio::run(done);
 }
 
 // This is a custom type used to have a custom implementation of the
 // `AsyncWrite::shutdown` method which actually calls `TcpStream::shutdown` to
 // notify the remote end that we're done writing.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct MyTcpStream(Arc<Mutex<TcpStream>>);
 
 impl Read for MyTcpStream {
