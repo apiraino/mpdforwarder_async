@@ -5,15 +5,15 @@ extern crate tokio;
 extern crate tokio_io;
 
 use std::env;
-use std::sync::{Arc, Mutex};
 use std::net::{Shutdown, SocketAddr};
+use std::sync::{Arc, Mutex};
 
-use encoding::{EncoderTrap, Encoding};
 use encoding::all::ASCII;
+use encoding::{EncoderTrap, Encoding};
 
+use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
-use tokio::io;
 use tokio_io::codec::LinesCodec;
 
 fn main() {
@@ -82,70 +82,61 @@ fn simple_client() {
 
 // Proxy inspects command received, sends command to server, read response, sends back a string to client
 fn proxy_1(client: TcpListener) {
-    let done = client
-        .incoming()
-        .map_err(|_| println!("err"))
-        .for_each(move |client| {
-            let (client_sink, client_stream) = client.framed(LinesCodec::new()).split();
-            let f = client_stream
-                .into_future()
-                .map_err(|_| {})
-                .map(|(payload, client_stream)| {
-                    let payload = payload.unwrap().clone();
-                    println!("got payload={:?}", payload);
+    let client_conns = client.incoming().map_err(|_| println!("err"));
+    let process_reqs = client_conns.for_each(move |client| {
+        let (client_sink, client_stream) = client.framed(LinesCodec::new()).split();
+        let stream_future = client_stream.into_future().map_err(|_| {});
+        let process_conn = stream_future.map(|(payload, client_stream)| {
+            let payload = payload.unwrap().clone();
+            println!("got payload={:?}", payload);
 
-                    // choose destination server
-                    let server_addr;
-                    if payload == "quit" {
-                        server_addr = "127.0.0.1:6602".parse::<SocketAddr>().unwrap();
-                    } else {
-                        server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
-                    }
+            // choose destination server
+            let server_addr;
+            if payload == "quit" {
+                server_addr = "127.0.0.1:6602".parse::<SocketAddr>().unwrap();
+            } else {
+                server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
+            }
 
-                    // connect to server
-                    let server_conn = TcpStream::connect(&server_addr);
+            // connect to server
+            let server_conn = TcpStream::connect(&server_addr).map_err(|err| eprintln!("{}", err));
+            let connected = server_conn.and_then(move |server_sock| {
+                println!("connected: {:?}", server_sock);
+                let mut command_bytes = ASCII.encode(&payload, EncoderTrap::Strict).unwrap();
+                command_bytes.push('\r' as u8);
+                command_bytes.push('\n' as u8);
 
-                    let connected = server_conn.map_err(|_| {}).and_then(move |server_sock| {
-                        println!("connected: {:?}", server_sock);
-                        let mut command_bytes =
-                            ASCII.encode(&payload, EncoderTrap::Strict).unwrap();
-                        command_bytes.push('\r' as u8);
-                        command_bytes.push('\n' as u8);
-
-                        let write_all = tokio_io::io::write_all(server_sock, command_bytes)
-                            .map_err(|err| eprintln!("{}", err))
-                            .and_then(|(stream, _payload)| {
-                                let reader = std::io::BufReader::new(stream);
-                                let read_resp = tokio_io::io::lines(reader)
-                                    .take_while(|line| future::ok(line != "OK"))
-                                    .map_err(|err| eprintln!("{}", err))
-                                    .for_each(|line| {
-                                        println!("got line = {}", line);
-                                        Ok(())
-                                    })
-                                    .then(|res| {
-                                        println!("res={:?}", res);
-                                        // proxy the line back to client
-                                        let client_reunited = client_sink
-                                            .reunite(client_stream)
-                                            .unwrap()
-                                            .into_inner();
-                                        let pong =
-                                            tokio_io::io::write_all(client_reunited, b"finished\n")
-                                                .map_err(|err| eprintln!("{}", err))
-                                                .then(|_| Ok(()));
-                                        tokio::spawn(pong)
-                                    });
-                                tokio::spawn(read_resp)
-                            });
-                        tokio::spawn(write_all)
-                    });
-                    tokio::run(connected)
+                let write_payload = tokio_io::io::write_all(server_sock, command_bytes)
+                    .map_err(|err| eprintln!("{}", err));
+                let response_reader = write_payload.and_then(|(stream, _payload)| {
+                    let reader = std::io::BufReader::new(stream);
+                    let resp_lines = tokio_io::io::lines(reader);
+                    let line_iter = resp_lines
+                        .take_while(|line| future::ok(line != "OK"))
+                        .map_err(|err| eprintln!("{}", err));
+                    let line_iter = line_iter
+                        .for_each(|line| {
+                            println!("got line = {}", line);
+                            Ok(())
+                        })
+                        .then(|res| {
+                            println!("res={:?}", res);
+                            // proxy the line back to client
+                            let client_reunited =
+                                client_sink.reunite(client_stream).unwrap().into_inner();
+                            let pong = tokio_io::io::write_all(client_reunited, b"finished\n");
+                            tokio::spawn(pong.map_err(|err| eprintln!("{}", err)).then(|_| Ok(())))
+                        });
+                    tokio::spawn(line_iter)
                 });
-            tokio::spawn(f)
+                tokio::spawn(response_reader)
+            });
+            tokio::run(connected)
         });
+        tokio::spawn(process_conn)
+    });
 
-    tokio::run(done);
+    tokio::run(process_reqs);
 }
 
 // Proxy sends command to server, forwards response without inspection
