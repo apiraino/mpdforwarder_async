@@ -36,14 +36,14 @@ fn process_arguments(arg: &str) {
             proxy_2(client);
         }
         "3" => {
-            simple_client(client);
+            simple_client();
         }
         _ => println!("Please choose a proxy"),
     }
 }
 
 // A simple client that connects to a server and reads its answer
-fn simple_client(client: TcpListener) {
+fn simple_client() {
     let server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
     let server_conn = TcpStream::connect(&server_addr);
     let task = server_conn
@@ -52,7 +52,7 @@ fn simple_client(client: TcpListener) {
             println!("conn successful");
             let write_all = tokio_io::io::write_all(socket, "status\r\n".as_bytes())
                 .map_err(|err| eprintln!("{}", err))
-                .and_then(|(stream, payload)| {
+                .and_then(|(stream, _payload)| {
                     // socket is never closed from MPD
                     // therefore the connection hangs until timeout
                     // let read_resp = tokio_io::io::read_to_end(stream, Vec::new())
@@ -103,7 +103,6 @@ fn proxy_1(client: TcpListener) {
                     }
 
                     // connect to server
-                    // let server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
                     let server_conn = TcpStream::connect(&server_addr);
 
                     let connected = server_conn.map_err(|_| {}).and_then(move |server_sock| {
