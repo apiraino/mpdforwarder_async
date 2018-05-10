@@ -8,7 +8,7 @@ A pet project to give a first glance at the Tokio library (basically some copy a
 
 ### Run with:
 
-    $ cargo watch -x run
+    $ cargo watch -x "run 1"
 
 ### Send cmd with:
 
