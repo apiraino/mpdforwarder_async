@@ -7,6 +7,7 @@ extern crate tokio_io;
 use std::env;
 use std::net::{Shutdown, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use encoding::all::ASCII;
 use encoding::{EncoderTrap, Encoding};
@@ -16,29 +17,59 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 use tokio_io::codec::LinesCodec;
 
-fn main() {
-    match env::args().nth(1) {
-        Some(arg) => process_arguments(&arg),
-        None => println!("Please choose proxy [1,2,3,...]"),
+// A custom type used to have a custom implementation of the
+// `AsyncWrite::shutdown` method which actually calls `TcpStream::shutdown` to
+// notify the remote end that we're done writing.
+#[derive(Clone)]
+struct MyTcpStream(Arc<Mutex<TcpStream>>);
+
+impl Read for MyTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().read(buf)
     }
 }
 
-fn process_arguments(arg: &str) {
+impl Write for MyTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncRead for MyTcpStream {}
+
+impl AsyncWrite for MyTcpStream {
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        try!(self.0.lock().unwrap().shutdown(Shutdown::Write));
+        Ok(().into())
+    }
+}
+
+macro_rules! println_marked {
+    ($param:expr) => {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let in_ms = ts.as_secs() * 1000 + ts.subsec_nanos() as u64 / 1_000_000;
+        println!("[{}] {}", in_ms, $param);
+    };
+}
+
+fn main() {
     let listen_addr = "127.0.0.1:6601".parse::<SocketAddr>().unwrap();
     let client = TcpListener::bind(&listen_addr).unwrap();
     println!("Listening on: {}", listen_addr);
-    println!("Running proxy {}", arg);
-    match arg {
-        "1" => {
-            proxy_1(client);
+
+    let arg = env::args().nth(1).unwrap();
+    match &*arg {
+        "simple_client" => simple_client(),
+        "proxy_1" => proxy_1(client),
+        "proxy_2" => proxy_2(client),
+        // "fix_time_wait" => fix_time_wait(client),
+        _ => {
+            eprintln!("Function {} not defined", arg);
         }
-        "2" => {
-            proxy_2(client);
-        }
-        "3" => {
-            simple_client();
-        }
-        _ => println!("Please choose a proxy"),
     }
 }
 
@@ -80,67 +111,8 @@ fn simple_client() {
     tokio::run(task);
 }
 
-// Proxy inspects command received, sends command to server, read response, sends back a string to client
-fn proxy_1(client: TcpListener) {
-    let client_conns = client.incoming().map_err(|_| println!("err"));
-    let process_reqs = client_conns.for_each(move |client| {
-        let (client_sink, client_stream) = client.framed(LinesCodec::new()).split();
-        let stream_future = client_stream.into_future().map_err(|_| {});
-        let process_conn = stream_future.map(|(payload, client_stream)| {
-            let payload = payload.unwrap().clone();
-            println!("got payload={:?}", payload);
-
-            // choose destination server
-            let server_addr;
-            if payload == "quit" {
-                server_addr = "127.0.0.1:6602".parse::<SocketAddr>().unwrap();
-            } else {
-                server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
-            }
-
-            // connect to server
-            let server_conn = TcpStream::connect(&server_addr).map_err(|err| eprintln!("{}", err));
-            let connected = server_conn.and_then(move |server_sock| {
-                println!("connected: {:?}", server_sock);
-                let mut command_bytes = ASCII.encode(&payload, EncoderTrap::Strict).unwrap();
-                command_bytes.push('\r' as u8);
-                command_bytes.push('\n' as u8);
-
-                let write_payload = tokio_io::io::write_all(server_sock, command_bytes)
-                    .map_err(|err| eprintln!("{}", err));
-                let response_reader = write_payload.and_then(|(stream, _payload)| {
-                    let reader = std::io::BufReader::new(stream);
-                    let resp_lines = tokio_io::io::lines(reader);
-                    let line_iter = resp_lines
-                        .take_while(|line| future::ok(line != "OK"))
-                        .map_err(|err| eprintln!("{}", err));
-                    let line_iter = line_iter
-                        .for_each(|line| {
-                            println!("got line = {}", line);
-                            Ok(())
-                        })
-                        .then(|res| {
-                            println!("res={:?}", res);
-                            // proxy the line back to client
-                            let client_reunited =
-                                client_sink.reunite(client_stream).unwrap().into_inner();
-                            let pong = tokio_io::io::write_all(client_reunited, b"finished\n");
-                            tokio::spawn(pong.map_err(|err| eprintln!("{}", err)).then(|_| Ok(())))
-                        });
-                    tokio::spawn(line_iter)
-                });
-                tokio::spawn(response_reader)
-            });
-            tokio::run(connected)
-        });
-        tokio::spawn(process_conn)
-    });
-
-    tokio::run(process_reqs);
-}
-
 // Proxy sends command to server, forwards response without inspection
-fn proxy_2(client: TcpListener) {
+fn proxy_1(client: TcpListener) {
     let done = client
         .incoming()
         .map_err(|e| println!("error accepting socket; error = {:?}", e))
@@ -173,33 +145,143 @@ fn proxy_2(client: TcpListener) {
     tokio::run(done);
 }
 
-// This is a custom type used to have a custom implementation of the
-// `AsyncWrite::shutdown` method which actually calls `TcpStream::shutdown` to
-// notify the remote end that we're done writing.
-#[derive(Clone, Debug)]
-struct MyTcpStream(Arc<Mutex<TcpStream>>);
+// when reading from a stream, the client connection hangs in TIME_WAIT
+// if we don't do anything after reading
+fn _fix_time_wait(client: TcpListener) {
+    let client_conns = client.incoming().map_err(|_| println!("err"));
+    let process_reqs = client_conns.for_each(move |client| {
+        println!("Request from {:?}", client);
 
-impl Read for MyTcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().read(buf)
-    }
+        // split client streams
+        let (client_sink, client_stream) = client.framed(LinesCodec::new()).split();
+        let client_stream_fut = client_stream.into_future();
+        let read_payload = client_stream_fut.then(|result| {
+            println!("we're done here, closing socket.");
+            let (_payload, stream) = result.unwrap();
+            let client_reunited = client_sink.reunite(stream).unwrap().into_inner();
+
+            // send something back to the client
+            // this will close the client stream
+            let pong = tokio_io::io::write_all(client_reunited, b"bye\n");
+            tokio::spawn(pong.map_err(|err| eprintln!("{}", err)).then(|_| Ok(())))
+
+            // this will leave the client stream in TIME_WAIT
+            // client_reunited.shutdown(Shutdown::Both).map_err(|_| {})
+        });
+        tokio::spawn(read_payload)
+    });
+    tokio::run(process_reqs.map_err(|_| {}));
 }
 
-impl Write for MyTcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
+/*
+- read client payload
+- connect to server
+- send msg to server
+- read server response (line by line)
+- send a msg back to client
+*/
+fn proxy_2(client: TcpListener) {
+    let mut counter: i32 = 0;
+    let get_counter = |num| num + 1;
+    let client_conns = client.incoming().map_err(|err| eprintln!("{}", err));
+    let process_reqs = client_conns.for_each(move |client| {
+        let conn_counter = counter;
+        counter = get_counter(counter);
+        println!("[CONN{}] [0] Request from {:?}", conn_counter, client);
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+        // split client streams
+        let (client_sink, client_stream) = client.framed(LinesCodec::new()).split();
+        let client_stream_fut = client_stream
+            .into_future()
+            .map_err(|err| eprintln!("{:?}", err));
+        let read_payload = client_stream_fut
+            .map(move |(payload, stream)| {
+                let payload = payload.unwrap();
+                println!(
+                    "[CONN{}] [1] payload rcvd '{}', calculating server port",
+                    conn_counter, payload
+                );
 
-impl AsyncRead for MyTcpStream {}
+                // choose destination server
+                let server_addr;
+                if payload == "quit" {
+                    server_addr = "127.0.0.1:6602".parse::<SocketAddr>().unwrap();
+                } else {
+                    server_addr = "127.0.0.1:6600".parse::<SocketAddr>().unwrap();
+                }
+                (payload, server_addr, stream)
+            })
+            .and_then(move |(payload, server_addr, client_stream_inner)| {
+                println!(
+                    "[CONN{}] [2] connecting to server {}",
+                    conn_counter, server_addr
+                );
 
-impl AsyncWrite for MyTcpStream {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        try!(self.0.lock().unwrap().shutdown(Shutdown::Write));
-        Ok(().into())
-    }
+                let server_conn = TcpStream::connect(&server_addr)
+                    .map(|stream| stream)
+                    .map_err(|err| eprintln!("{}", err));
+                let connected = server_conn.and_then(move |server_sock| {
+                    println!(
+                        "[CONN{}] [3] connected to server {:?}",
+                        conn_counter, server_sock
+                    );
+                    // format new payload
+                    let mut command_bytes = ASCII.encode(&payload, EncoderTrap::Strict).unwrap();
+                    command_bytes.push('\r' as u8);
+                    command_bytes.push('\n' as u8);
+
+                    // send msg to server *and* read response
+                    let write_payload = tokio_io::io::write_all(server_sock, command_bytes)
+                        .map_err(|err| eprintln!("{}", err));
+                    let response_reader = write_payload.and_then(move |(stream, msg)| {
+                        println!(
+                            "[CONN{}] [4] msg '{}' sent to server",
+                            conn_counter,
+                            String::from_utf8(msg).unwrap().trim()
+                        );
+                        let reader = std::io::BufReader::new(stream);
+                        let resp_lines = tokio_io::io::lines(reader);
+                        let line_iter = resp_lines
+                            .take_while(|line| future::ok(line != "OK"))
+                            .map_err(|err| eprintln!("{}", err));
+                        let line_iter = line_iter
+                            .for_each(|line| {
+                                println!("got line = {}", line);
+                                Ok(())
+                            })
+                            .then(move |_| {
+                                println!("[CONN{}] [5] response read from server", conn_counter);
+                                // send a msg back to client
+                                // this prevents the client connection to hang in TIME_WAIT
+                                let client_reunited = client_sink
+                                    .reunite(client_stream_inner)
+                                    .unwrap()
+                                    .into_inner();
+                                let pong = tokio_io::io::write_all(client_reunited, b"OK\n");
+                                tokio::spawn(pong.map_err(|err| eprintln!("{}", err)).then(
+                                    move |res| {
+                                        let (stream, msg) = res.unwrap();
+                                        println!(
+                                            "[CONN{}] [6] '{}' msg replied to client {:?}",
+                                            conn_counter,
+                                            String::from_utf8(msg.to_vec()).unwrap().trim(),
+                                            stream
+                                        );
+                                        Ok(())
+                                    },
+                                ))
+                            });
+                        tokio::spawn(line_iter)
+                    });
+                    tokio::spawn(response_reader)
+                });
+                tokio::spawn(connected)
+            })
+            .then(move |result| {
+                println!("[CONN{}] [7] client payload read", conn_counter);
+                result
+            });
+        tokio::spawn(read_payload)
+    });
+    tokio::run(process_reqs.map_err(|_| {}));
 }

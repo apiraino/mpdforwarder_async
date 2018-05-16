@@ -12,7 +12,9 @@ A pet project to give a first glance at the Tokio library (basically some copy a
 
 ### Send cmd with:
 
-    $ echo "status" | ncat 127.0.0.1 6601
+    $ echo "status" | ncat --send-only 127.0.0.1 6601
+
+    `--send-only` to avoid the client->proxy socket half to hang in TIME_WAIT
 
 ### Check what the server receives:
 
